@@ -3,6 +3,7 @@ package garden_test
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,4 +65,36 @@ func TestQueue_NoDuplicateProcessing(t *testing.T) {
 			t.Errorf("item %d was processed %d times (expected 1)", i, seen[i])
 		}
 	}
+}
+
+func TestQueue_GracefulShutdown(t *testing.T) {
+	var processed int64
+
+	q := garden.NewQueue(func(item int) error {
+		atomic.AddInt64(&processed, 1)
+		time.Sleep(5 * time.Millisecond)
+		return nil
+	}, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	q.Serve(ctx)
+
+	for i := 0; i < 50; i++ {
+		_ = q.Push(i)
+	}
+	time.Sleep(20 * time.Millisecond) // let some items process
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		q.Shutdown()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	// shutdown completed successfully
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown() did not return - possible deadlock or goroutine leak")
+	}
+	t.Logf("items processed before shutdown: %d", atomic.LoadInt64(&processed))
 }
