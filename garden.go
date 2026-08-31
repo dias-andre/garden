@@ -7,19 +7,25 @@ import (
 	"sync"
 )
 
-var ErrQueueClosed = errors.New("queue closed")
+var (
+	ErrQueueClosed   = errors.New("queue closed")
+	ErrQueueDraining = errors.New("queue draining")
+)
 
 type WorkerFn[T any] func(item T) error
 
 type Queue[T any] struct {
 	mu              sync.Mutex
-	items           []T
 	cond            *sync.Cond
-	closed          bool
-	workerFn        WorkerFn[T]
-	workerCount     int
-	dispatchedItems chan T
 	wg              sync.WaitGroup
+	dispatchedItems chan T
+
+	closed   bool
+	draining bool
+
+	items       []T
+	workerFn    WorkerFn[T]
+	workerCount int
 }
 
 func NewQueue[T any](fn WorkerFn[T], count int) *Queue[T] {
@@ -35,6 +41,10 @@ func (q *Queue[T]) Push(item T) error {
 	if q.closed {
 		q.mu.Unlock()
 		return errors.Join(errors.New("cannot push"), ErrQueueClosed)
+	}
+	if q.draining {
+		q.mu.Unlock()
+		return ErrQueueDraining
 	}
 	q.items = append(q.items, item)
 	q.mu.Unlock()
@@ -100,6 +110,43 @@ func (q *Queue[T]) Serve(ctx context.Context) {
 	}()
 }
 
-func (q *Queue[T]) Shutdown() {
-	q.wg.Wait()
+func (q *Queue[T]) Shutdown(ctx context.Context) error {
+	q.Close()
+	done := make(chan struct{})
+	go func() {
+		q.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (q *Queue[T]) DrainAndShutdown(ctx context.Context) error {
+	q.mu.Lock()
+
+	if q.closed {
+		q.mu.Unlock()
+		return ErrQueueClosed
+	}
+
+	q.draining = true
+	q.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		q.wg.Wait()
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		q.Close()
+		return ctx.Err()
+	}
 }
