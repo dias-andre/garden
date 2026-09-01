@@ -2,6 +2,7 @@ package garden_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -84,17 +85,14 @@ func TestQueue_GracefulShutdown(t *testing.T) {
 	time.Sleep(20 * time.Millisecond) // let some items process
 	cancel()
 
-	done := make(chan struct{})
-	go func() {
-		q.Shutdown()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	// shutdown completed successfully
-	case <-time.After(2 * time.Second):
-		t.Fatal("Shutdown() did not return - possible deadlock or goroutine leak")
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelShutdown()
+	if err := q.Shutdown(shutdownCtx); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown() did not return - possible deadlock or goroutine leak")
+		}
+		t.Fatalf("Failed to run shutdown: %v", err)
 	}
+
 	t.Logf("items processed before shutdown: %d", atomic.LoadInt64(&processed))
 }
