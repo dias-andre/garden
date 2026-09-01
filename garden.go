@@ -58,7 +58,7 @@ func (q *Queue[T]) Pop() (T, bool) {
 	for len(q.items) == 0 && !q.closed {
 		q.cond.Wait()
 	}
-	for len(q.items) == 0 && q.closed {
+	if len(q.items) == 0 {
 		var zero T
 		return zero, false
 	}
@@ -74,8 +74,7 @@ func (q *Queue[T]) Close() {
 	q.cond.Broadcast()
 }
 
-func (q *Queue[T]) Serve(ctx context.Context) {
-	q.dispatchedItems = make(chan T, 100)
+func (q *Queue[T]) startWorkers() {
 	for i := 0; i < q.workerCount; i++ {
 		q.wg.Add(1)
 		go func(id int, items <-chan T) {
@@ -86,10 +85,10 @@ func (q *Queue[T]) Serve(ctx context.Context) {
 			}
 		}(i, q.dispatchedItems)
 	}
+}
 
-	q.wg.Add(1)
-	go func() {
-		defer q.wg.Done()
+func (q *Queue[T]) startDispatcher(ctx context.Context) {
+	q.wg.Go(func() {
 		defer close(q.dispatchedItems)
 		for {
 			item, ok := q.Pop()
@@ -102,7 +101,13 @@ func (q *Queue[T]) Serve(ctx context.Context) {
 				return
 			}
 		}
-	}()
+	})
+}
+
+func (q *Queue[T]) Serve(ctx context.Context) {
+	q.dispatchedItems = make(chan T, 100)
+	q.startWorkers()
+	q.startDispatcher(ctx)
 
 	go func() {
 		<-ctx.Done()
@@ -135,6 +140,7 @@ func (q *Queue[T]) DrainAndShutdown(ctx context.Context) error {
 
 	q.draining = true
 	q.mu.Unlock()
+	q.cond.Broadcast()
 
 	done := make(chan error, 1)
 	go func() {
