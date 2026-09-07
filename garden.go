@@ -1,4 +1,8 @@
-// Package garden: the root library code
+// Package garden provides a small, generic worker pool for processing items
+// with built-in support for retries and graceful shutdown.
+//
+// It's designed for small to medium workloads where you need concurrent
+// processing without the overhead of a full message broker.
 package garden
 
 import (
@@ -9,19 +13,33 @@ import (
 )
 
 var (
-	ErrQueueClosed   = errors.New("queue closed")
+	// ErrQueueClosed is returned when trying to push to closed queue.
+	ErrQueueClosed = errors.New("queue closed")
+	// ErrQueueDraining is returned when trying to push during drain shutdown.
 	ErrQueueDraining = errors.New("queue draining")
 )
 
-type WorkerFn[T any] func(item T) error
+type (
+	// WorkerFn is the function type that processes items from queue.
+	// It should return an error if processing fails (which may trigger retries).
+	WorkerFn[T any]     func(item T) error
+	DeadLetterFn[T any] func(item T, err error, attempts int)
+	BackoffFn           func(int) time.Duration
+)
 
 type queueJob[T any] struct {
 	item      T
-	attempt   int
+	attempts  int
 	lastErr   error
 	lastRetry time.Time
 }
 
+// Queue is a generic worker pool that processes items concurrently.
+// It supports automatic retries with exponential backoff and graceful shutdown.
+// It uses an internal slice (protected by mutex) as an unbounded input buffer
+// and a fixed-size channel to distribute work to workers. This hybrid approach
+// allows producers to push items without blocking while preventing workers
+// from being overwhelmed.
 type Queue[T any] struct {
 	mu              sync.Mutex
 	cond            *sync.Cond
@@ -34,8 +52,20 @@ type Queue[T any] struct {
 	jobs        []queueJob[T]
 	workerFn    WorkerFn[T]
 	workerCount int
+
+	maxRetries     int
+	backoffFn      BackoffFn
+	onDeadLetterFn DeadLetterFn[T]
 }
 
+// NewQueue creates a new worker pool with the given worker function and worker count.
+//
+// The workerFn is called for each item in the queue. If it returns an error,
+// the item will be retried (if retries are configured) or sent to the dead letter handler.
+//
+// Example:
+//
+//	q := garden.NewQueue[Email](sendEmail, 4)
 func NewQueue[T any](fn WorkerFn[T], count int) *Queue[T] {
 	q := &Queue[T]{}
 	q.cond = sync.NewCond(&q.mu)
@@ -44,7 +74,31 @@ func NewQueue[T any](fn WorkerFn[T], count int) *Queue[T] {
 	return q
 }
 
-func (q *Queue[T]) Push(item T) error {
+// WithRetries configures the maximum number of retry attempts for failed items.
+// Default is 0 (no retries). The first attempt counts as attempts 1.
+//
+// Example:
+// q := garden.NewQueue[Email](sendEmail, 4)
+//
+//	.WithRetries(3)
+//	.WithBackoff(exponentialBackoff)
+func (q *Queue[T]) WithRetries(r int) *Queue[T] {
+	q.maxRetries = r
+	return q
+}
+
+// WithBackoff configures the backoff function which calculates the delay between retries.
+func (q *Queue[T]) WithBackoff(b BackoffFn) *Queue[T] {
+	q.backoffFn = b
+	return q
+}
+
+func (q *Queue[T]) OnDeadLetter(dt DeadLetterFn[T]) *Queue[T] {
+	q.onDeadLetterFn = dt
+	return q
+}
+
+func (q *Queue[T]) pushJob(newJob queueJob[T]) error {
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
@@ -54,18 +108,13 @@ func (q *Queue[T]) Push(item T) error {
 		q.mu.Unlock()
 		return ErrQueueDraining
 	}
-	newJob := queueJob[T]{
-		item:    item,
-		attempt: 1,
-		lastErr: nil,
-	}
 	q.jobs = append(q.jobs, newJob)
 	q.mu.Unlock()
 	q.cond.Signal()
 	return nil
 }
 
-func (q *Queue[T]) pop() (queueJob[T], bool) {
+func (q *Queue[T]) popJob() (queueJob[T], bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for len(q.jobs) == 0 && !q.closed {
@@ -80,26 +129,61 @@ func (q *Queue[T]) pop() (queueJob[T], bool) {
 	return job, true
 }
 
-func (q *Queue[T]) PopItem() (T, bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	for len(q.jobs) == 0 && !q.closed {
-		q.cond.Wait()
+// Push adds an item to the queue for processing
+//
+// Returns ErrQueueClosed if the queue has been closed, or ErrQueueDraining
+// if the queue is in draining mode.
+func (q *Queue[T]) Push(item T) error {
+	newJob := queueJob[T]{
+		item: item,
 	}
-	if len(q.jobs) == 0 {
-		var zero T
-		return zero, false
-	}
-	job := q.jobs[0]
-	q.jobs = q.jobs[1:]
-	return job.item, true
+	return q.pushJob(newJob)
 }
 
+// Pop removes and returns the next item from the queue.
+//
+// It blocks until an item is available, the queue is closed, or draining mode
+// is entered with no items remaining.
+//
+// Pop returns (item, true) if an item was successfully retrieved.
+// It returns (zero, false) if the queue is closed or in draining mode with no items left.
+func (q *Queue[T]) Pop() (T, bool) {
+	job, status := q.popJob()
+	return job.item, status
+}
+
+// Close closes the queue immediately and stops all workers.
+// After Close(), Push() will return ErrQueueClosed.
+// Items not yet dispatched to workers are discarded.
+//
+// For graceful shutdown that processes remaining items, use DrainAndShutdown instead.
 func (q *Queue[T]) Close() {
 	q.mu.Lock()
 	q.closed = true
 	q.mu.Unlock()
 	q.cond.Broadcast()
+}
+
+func (q *Queue[T]) processJob(job queueJob[T]) {
+	err := q.workerFn(job.item)
+	if err != nil {
+		if job.attempts <= q.maxRetries {
+			backoff := time.Second * 0
+			if q.backoffFn != nil {
+				backoff = q.backoffFn(job.attempts)
+			}
+			job.attempts++
+			job.lastErr = err
+			job.lastRetry = time.Now()
+
+			time.Sleep(backoff)
+			_ = q.pushJob(job)
+		} else {
+			if q.onDeadLetterFn != nil {
+				q.onDeadLetterFn(job.item, err, job.attempts)
+			}
+		}
+	}
 }
 
 func (q *Queue[T]) startWorkers() {
@@ -108,8 +192,7 @@ func (q *Queue[T]) startWorkers() {
 		go func(id int, items <-chan queueJob[T]) {
 			defer q.wg.Done()
 			for job := range items {
-				// TODO: manage error
-				_ = q.workerFn(job.item)
+				q.processJob(job)
 			}
 		}(i, q.dispatchedItems)
 	}
@@ -119,7 +202,7 @@ func (q *Queue[T]) startDispatcher(ctx context.Context) {
 	q.wg.Go(func() {
 		defer close(q.dispatchedItems)
 		for {
-			item, ok := q.pop()
+			item, ok := q.popJob()
 			if !ok {
 				return
 			}
@@ -132,6 +215,33 @@ func (q *Queue[T]) startDispatcher(ctx context.Context) {
 	})
 }
 
+// Serve starts the worker pool and begins processing items from the queue.
+//
+// It starts the configured number of workers in separate goroutines and creates
+// a dispatcher that pulls items from the queue and sends them to workers.
+// Workers will continue processing until the queue is closed or the context is cancelled.
+//
+// The context is used to signal graceful shutdown. When ctx.Done() is signalled,
+// the dispatcher stops accepting new items but already-queued items may continue
+// processing until Close() is called.
+//
+// Serve is non-blocking and returns immediately. Call Shutdown() or DrainAndShutdown()
+// to stop the workers.
+//
+// Example:
+//
+//	ctx, cancel := context.WithCancel(context.Background())
+//	defer cancel()
+//
+//	q := garden.NewQueue[Email](sendEmail, 4)
+//	q.Serve(ctx)
+//
+//	// Push items to be processed
+//	q.Push(email1)
+//	q.Push(email2)
+//
+//	// Gracefully shutdown when done
+//	q.DrainAndShutdown(context.Background())
 func (q *Queue[T]) Serve(ctx context.Context) {
 	q.dispatchedItems = make(chan queueJob[T], 100)
 	q.startWorkers()
@@ -143,6 +253,21 @@ func (q *Queue[T]) Serve(ctx context.Context) {
 	}()
 }
 
+// Shutdown closes the queue immediately and stops all workers.
+// It waits up to the context deadline for workers to finish.
+// Items not yet dispatched to workers are discarded.
+// Push() will return ErrQueueClosed after this call.
+//
+// Returns an error if the context deadline is exceeded before workers stop.
+// Use DrainAndShutdown for graceful shutdown that processes remaining items.
+//
+// Example:
+// ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
+// defer cancel()
+//
+//	if err := queue.Shutdown(ctx); err != nil {
+//	  log.Printf("shutdown timeout: %v", err)
+//	}
 func (q *Queue[T]) Shutdown(ctx context.Context) error {
 	q.Close()
 	done := make(chan struct{})
@@ -158,6 +283,25 @@ func (q *Queue[T]) Shutdown(ctx context.Context) error {
 	}
 }
 
+// DrainAndShutdown gracefully shuts down the queue by processing all remaining items
+// before stopping workers.
+//
+// It enters draining mode, which rejects new Push() calls but continues processing
+// items already in the queue. Workers stop only after all items are processed.
+//
+// Returns an error if the context deadline is exceeded before all items are processed.
+// If the deadline is exceeded, Close() is called to force shutdown and return the error.
+//
+// Use this for critical workloads (e.g., email delivery) where losing items is unacceptable.
+// Use Shutdown for fast shutdown when graceful processing is not required.
+//
+// Example:
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	if err := q.DrainAndShutdown(ctx); err == context.DeadlineExceeded {
+//		log.Println("drain timeout, some items may be lost")
+//	}
 func (q *Queue[T]) DrainAndShutdown(ctx context.Context) error {
 	q.mu.Lock()
 
