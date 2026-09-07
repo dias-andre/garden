@@ -46,9 +46,27 @@ func main() {
 		_ = q.Push(fmt.Sprintf("job-%d", i))
 	}
 
-	q.Shutdown()
+	if err := q.Shutdown(ctx); err != nil {
+		fmt.Println("shutdown failed:", err)
+	}
 	fmt.Println("all done")
 }
+```
+
+### Retries and dead letters
+
+`WorkerFn` may return an error for a failed item. garden can retry it with backoff
+and, once the retries are exhausted, hand it to a dead-letter handler:
+
+```go
+q := garden.NewQueue(sendEmail, 4). // sendEmail(item Email) error
+	WithRetries(3).
+	WithBackoff(func(attempt int) time.Duration {
+		return time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s
+	}).
+	OnDeadLetter(func(item Email, err error, attempts int) {
+		log.Printf("email %q failed after %d attempts: %v", item.Subject, attempts, err)
+	})
 ```
 
 ## How it works
@@ -57,9 +75,9 @@ The core idea is a two-stage pipeline: an unbounded slice buffer feeds a bounded
 channel, which fans out to a fixed pool of workers.
 
 ```
-Push(item)                Pop()                 dispatchedItems            workers
+Push(item)                Pop()                dispatchedItems            workers
    |                        |                         |                       |
-   +--> items []T -------> chan T (cap 100) ------> workerFn(item) x N
+   +--> items []T -------> chan T (cap 100) ------> processJob(item) x N
         (slice + mutex         (dispatcher
          + cond)               goroutine)
 ```
@@ -108,7 +126,7 @@ load balancing -- whichever worker is free picks up the next item:
 // simplified worker
 go func() {
     for job := range q.dispatchedItems {
-        q.workerFn(job)
+        q.processJob(job)
     }
 }()
 ```
@@ -116,15 +134,49 @@ go func() {
 This is the standard fan-out pattern. The channel capacity (100) controls how many
 items can be "in flight" between the dispatcher and the workers at any given time.
 
+### Stage 3: retries and dead letters
+
+Once a worker receives a job, it runs it through `processJob`. If `workerFn` returns an
+error and retries are configured, the job is re-queued -- back into the same slice
+buffer, right where it started -- with its attempt counter incremented.
+
+```go
+func processJob(job queueJob) {
+    err := workerFn(job.item)
+    if err == nil {
+        return
+    }
+    if job.attempts <= maxRetries {
+        time.Sleep(backoffFn(job.attempts)) // exponential backoff
+        job.attempts++
+        pushJob(job)                        // re-queue for another try
+        return
+    }
+    onDeadLetterFn(job.item, err, job.attempts) // give up and report
+}
+```
+
+Re-queueing is what makes retries work without any extra machinery: the job goes
+through the exact same pipeline as a freshly pushed item, so it is naturally processed
+by whichever worker finishes next. The `Push`-during-`Close` guard is skipped for
+internal re-pushes, so a drain that is still running keeps retrying in-flight work.
+
 ### Graceful shutdown
 
-When the context is cancelled, a background goroutine calls `Close()` on the queue.
-This sets a `closed` flag and broadcasts to all blocked `Pop()` calls. The dispatcher
-sees the queue is closed, finishes sending any remaining items, closes the channel,
-and the workers drain whatever is left.
+When the context passed to `Serve` is cancelled, a background goroutine calls `Close()`
+on the queue. This sets a `closed` flag and broadcasts to all blocked `Pop()` calls. The
+dispatcher sees the queue is closed, finishes sending any remaining items, closes the
+channel, and the workers drain whatever is left.
 
-`Shutdown()` waits for all workers and the dispatcher to finish, so you are guaranteed
-that every item pushed before the context was cancelled gets processed.
+There are two ways to stop a running queue:
+
+- **`Shutdown(ctx)`** closes the queue immediately and waits for in-flight workers to
+  finish, discarding items not yet dispatched. It returns an error if the context
+  deadline expires first.
+- **`DrainAndShutdown(ctx)`** enters draining mode first: new `Push()` calls are
+  rejected, but every remaining item -- plus anything re-queued by retries -- is
+  processed before the workers stop. If the deadline expires, it forces a `Close()` and
+  returns the error.
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
@@ -134,8 +186,10 @@ q.Serve(ctx)
 _ = q.Push("work-1")
 _ = q.Push("work-2")
 
-cancel()      // signal shutdown
-q.Shutdown()  // block until everything is processed
+cancel()                             // signal shutdown
+if err := q.DrainAndShutdown(context.Background()); err != nil {
+    log.Println("drain failed:", err)
+}
 ```
 
 ## API
@@ -145,20 +199,49 @@ q.Shutdown()  // block until everything is processed
 Creates a new queue. `fn` is the function each worker calls for every item. `count` is
 the number of worker goroutines.
 
+### `(*Queue).WithRetries(r int) *Queue[T]`
+
+Sets the maximum number of retries for failed items. Default is `0` (no retries): a
+failed item is handed straight to the dead-letter handler. Config methods are chainable
+and must be called before `Serve`.
+
+### `(*Queue).WithBackoff(b BackoffFn) *Queue[T]`
+
+Sets the delay function used between retries. `BackoffFn` receives the attempt number
+and returns the `time.Duration` to sleep. Defaults to no delay.
+
+### `(*Queue).OnDeadLetter(dt DeadLetterFn[T]) *Queue[T]`
+
+Sets the handler called when an item exhausts all retries. `DeadLetterFn` receives the
+item, the last error, and the total number of attempts. No-op by default.
+
 ### `Push(item T) error`
 
 Adds an item to the queue. Returns an error wrapping `ErrQueueClosed` if the queue has
-been closed. Under normal operation, this never blocks.
+been closed, or `ErrQueueDraining` during a drain. Under normal operation, this never
+blocks.
+
+### `Pop() (T, bool)`
+
+Removes and returns the next item from the queue. Blocks until an item is available or
+the queue is closed/drainged. Returns `(zero, false)` when no items remain.
 
 ### `Serve(ctx context.Context)`
 
 Starts the dispatcher and worker goroutines. Call this once, after pushing initial items
-or before pushing -- it does not matter, since Push never blocks.
+or before pushing -- it does not matter, since Push never blocks. Cancelling `ctx` closes
+the queue.
 
-### `Shutdown()`
+### `Shutdown(ctx context.Context) error`
 
-Blocks until all workers finish. Call this after cancelling the context to ensure a
-clean exit.
+Closes the queue immediately and blocks until all in-flight workers finish, up to the
+context deadline. Items not yet dispatched are discarded. Returns `ctx.Err()` on timeout.
+
+### `DrainAndShutdown(ctx context.Context) error`
+
+Gracefully processes every remaining item before stopping the workers. New `Push()` calls
+are rejected with `ErrQueueDraining`. Returns `ctx.Err()` if the deadline expires before
+the drain completes.
 
 ## FAQ
 
@@ -172,10 +255,14 @@ Yes. Push works at any time before Close. The dispatcher will pick up new items 
 appear in the slice.
 
 **Q: What happens if a worker returns an error?**
-Currently, errors are ignored (the return value of `workerFn` is discarded). This is
-intentional for simplicity in small environments. If you need error handling, you can
-handle it inside the worker function itself (log, retry, store in a shared variable,
-etc.).
+If `WithRetries` is configured, the item is re-queued and processed again, with a backoff
+delay in between. Once the attempt limit is reached, `OnDeadLetter` is called (or the
+error is silently dropped if no handler is set). Without retries, the dead-letter handler
+runs immediately on the first failure.
+
+**Q: How many times will a job be attempted with `WithRetries(3)`?**
+Four: the initial attempt plus three retries. The retry count passed to `WithBackoff` and
+`OnDeadLetter` starts at `1` for the first attempt after the initial failure.
 
 **Q: What is the channel capacity and can I change it?**
 The dispatch channel has a fixed capacity of 100. This is hardcoded. For a garden-sized
@@ -183,15 +270,15 @@ tool, 100 items in flight is more than enough. If you need a different value, it
 be a one-line change in `garden.go`.
 
 **Q: Is this safe for concurrent use?**
-Yes. `Push` is safe to call from multiple goroutines. `Pop` is internal and not exported.
-`Serve` and `Shutdown` should be called once from a single goroutine.
+Yes. `Push` is safe to call from multiple goroutines. `Serve`, `Shutdown`, and
+`DrainAndShutdown` should be called once from a single goroutine.
 
-**Q: What happens if I call Shutdown without Serve?**
-It returns immediately since no goroutines are tracked in the WaitGroup. No panic, no
-deadlock.
+**Q: What happens if I call Shutdown/DrainAndShutdown without Serve?**
+They return immediately since no goroutines are tracked in the WaitGroup (or, for a drain,
+after closing the queue). No panic, no deadlock.
 
 **Q: What happens if I call Push after Close?**
-You get an error: `cannot push: queue closed`.
+You get an error wrapping `ErrQueueClosed`.
 
 ## Tests
 
@@ -216,6 +303,11 @@ go test -v -race ./...
 ```
 
 The `-race` flag is recommended to catch any concurrency issues.
+
+## Docs
+
+A line-by-line walkthrough of the implementation lives in
+[docs/walkthrough.md](docs/walkthrough.md).
 
 ## License
 
