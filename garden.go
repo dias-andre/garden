@@ -53,12 +53,12 @@ type Queue[T any] struct {
 	internalCtxCancel context.CancelFunc
 
 	jobs        []queueJob[T]
-	workerFn    WorkerFn[T]
+	workerFn    func(item T) error
 	workerCount int
 
 	maxRetries     int
-	backoffFn      BackoffFn
-	onDeadLetterFn DeadLetterFn[T]
+	backoffFn      func(int) time.Duration
+	onDeadLetterFn func(item T, err error, attempts int)
 
 	// rate limit
 	useRateLimit bool
@@ -71,9 +71,9 @@ func (q *Queue[T]) pushJob(newJob queueJob[T]) error {
 		q.mu.Unlock()
 		return errors.Join(errors.New("cannot push"), ErrQueueClosed)
 	}
-	if q.draining {
+	if q.draining && newJob.attempts == 0 {
 		q.mu.Unlock()
-		return ErrQueueDraining
+		return errors.Join(errors.New("cannot push"), ErrQueueDraining)
 	}
 	q.jobs = append(q.jobs, newJob)
 	q.mu.Unlock()
@@ -100,16 +100,26 @@ func (q *Queue[T]) processJob(job queueJob[T]) {
 	err := q.workerFn(job.item)
 	if err != nil {
 		if job.attempts <= q.maxRetries {
-			backoff := time.Second * 0
-			if q.backoffFn != nil {
-				backoff = q.backoffFn(job.attempts)
-			}
+			backoff := time.Duration(0)
 			job.attempts++
 			job.lastErr = err
 			job.lastRetry = time.Now()
 
+			if q.backoffFn != nil {
+				backoff = q.backoffFn(job.attempts)
+			}
+			if backoff > 0 {
+				select {
+				case <-time.After(backoff):
+				case <-q.internalCtx.Done():
+					return
+				}
+			}
+
 			time.Sleep(backoff)
-			_ = q.pushJob(job)
+			if err := q.pushJob(job); err != nil && q.onDeadLetterFn != nil {
+				q.onDeadLetterFn(job.item, err, job.attempts)
+			}
 			return
 		}
 		if q.onDeadLetterFn != nil {
@@ -184,12 +194,12 @@ func (q *Queue[T]) WithRetries(r int) *Queue[T] {
 }
 
 // WithBackoff configures the backoff function which calculates the delay between retries.
-func (q *Queue[T]) WithBackoff(b BackoffFn) *Queue[T] {
+func (q *Queue[T]) WithBackoff(b func(int) time.Duration) *Queue[T] {
 	q.backoffFn = b
 	return q
 }
 
-func (q *Queue[T]) OnDeadLetter(dt DeadLetterFn[T]) *Queue[T] {
+func (q *Queue[T]) OnDeadLetter(dt func(item T, err error, attempt int)) *Queue[T] {
 	q.onDeadLetterFn = dt
 	return q
 }
@@ -208,7 +218,8 @@ func (q *Queue[T]) WithRateLimit(items int, interval time.Duration) *Queue[T] {
 // if the queue is in draining mode.
 func (q *Queue[T]) Push(item T) error {
 	newJob := queueJob[T]{
-		item: item,
+		item:     item,
+		attempts: 0, // new job
 	}
 	return q.pushJob(newJob)
 }
