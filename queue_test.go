@@ -94,5 +94,42 @@ func TestQueue_GracefulShutdown(t *testing.T) {
 		t.Fatalf("Failed to run shutdown: %v", err)
 	}
 
-	t.Logf("items processed before shutdown: %d", atomic.LoadInt64(&processed))
+	t.Logf("processed items before shutdown: %d", atomic.LoadInt64(&processed))
+}
+
+func TestQueue_RateLimit(t *testing.T) {
+	var processedCount atomic.Int64
+
+	q := garden.NewQueue[int](func(item int) error {
+		processedCount.Add(1)
+		return nil
+	}, 5).WithRateLimit(10, time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	q.Serve(ctx)
+	totalJobs := 20
+	for i := 0; i < totalJobs; i++ {
+		_ = q.Push(i)
+	}
+
+	start := time.Now()
+
+	if err := q.DrainAndShutdown(ctx); err != nil {
+		t.Fatalf("failed to wait queue processing: %v", err)
+	}
+
+	elapsed := time.Since(start)
+
+	if processedCount.Load() != int64(totalJobs) {
+		t.Errorf("expected %d processed items, got %d", totalJobs, processedCount.Load())
+	}
+
+	minExpectedDuration := 1 * time.Second
+	if elapsed < minExpectedDuration {
+		t.Errorf("process too fast: expected duration: %v, got: %v", minExpectedDuration, elapsed)
+	}
+
+	t.Logf("elapsed time: %v", elapsed)
 }
