@@ -44,7 +44,6 @@ type Queue[T any] struct {
 	mu              sync.Mutex
 	cond            *sync.Cond
 	workersWG       sync.WaitGroup
-	backgroundWG    sync.WaitGroup
 	dispatchedItems chan queueJob[T]
 
 	closed   bool
@@ -62,10 +61,8 @@ type Queue[T any] struct {
 	onDeadLetterFn DeadLetterFn[T]
 
 	// rate limit
-	useRateLimit      bool
-	rateLimitItems    int
-	rateLimitInterval time.Duration
-	limitedTokens     chan struct{}
+	useRateLimit bool
+	rateLimiter  *rateLimiter
 }
 
 func (q *Queue[T]) pushJob(newJob queueJob[T]) error {
@@ -129,7 +126,9 @@ func (q *Queue[T]) startWorkers() {
 			defer q.workersWG.Done()
 			for job := range items {
 				if q.useRateLimit {
-					<-q.limitedTokens
+					if err := q.rateLimiter.Wait(q.internalCtx); err != nil {
+						return
+					}
 				}
 				q.processJob(job)
 			}
@@ -138,6 +137,7 @@ func (q *Queue[T]) startWorkers() {
 }
 
 func (q *Queue[T]) startDispatcher(ctx context.Context) {
+	q.dispatchedItems = make(chan queueJob[T], 100)
 	q.workersWG.Go(func() {
 		defer close(q.dispatchedItems)
 		for {
@@ -148,38 +148,6 @@ func (q *Queue[T]) startDispatcher(ctx context.Context) {
 			select {
 			case q.dispatchedItems <- item:
 			case <-ctx.Done():
-				return
-			}
-		}
-	})
-}
-
-func clearChan[T any](ch <-chan T) {
-	for {
-		select {
-		case <-ch:
-		default:
-			return
-		}
-	}
-}
-
-func (q *Queue[T]) startRateLimitReset(ctx context.Context) {
-	q.backgroundWG.Go(func() {
-		ticker := time.NewTicker(q.rateLimitInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				clearChan(q.limitedTokens)
-				for i := 0; i < q.rateLimitItems; i++ {
-					select {
-					case q.limitedTokens <- struct{}{}:
-					default:
-					}
-				}
-			case <-ctx.Done():
-				clearChan(q.limitedTokens)
 				return
 			}
 		}
@@ -227,8 +195,9 @@ func (q *Queue[T]) OnDeadLetter(dt DeadLetterFn[T]) *Queue[T] {
 }
 
 func (q *Queue[T]) WithRateLimit(items int, interval time.Duration) *Queue[T] {
-	q.rateLimitItems = items
-	q.rateLimitInterval = interval
+	// q.rateLimitItems = items
+	// q.rateLimitInterval = interval
+	q.rateLimiter = newRateLimiter(items, interval)
 	q.useRateLimit = true
 	return q
 }
@@ -303,14 +272,9 @@ func (q *Queue[T]) Serve(ctx context.Context) {
 	q.internalCtx = newCtx
 	q.internalCtxCancel = newCancel
 
-	q.dispatchedItems = make(chan queueJob[T], 100)
-	if q.useRateLimit {
-		q.limitedTokens = make(chan struct{}, q.rateLimitItems)
-		q.startRateLimitReset(q.internalCtx)
-	}
+	q.startDispatcher(q.internalCtx)
 
 	q.startWorkers()
-	q.startDispatcher(q.internalCtx)
 	go func() {
 		<-ctx.Done()
 		q.Close()
@@ -379,7 +343,6 @@ func (q *Queue[T]) DrainAndShutdown(ctx context.Context) error {
 	go func() {
 		q.workersWG.Wait()
 		q.internalCtxCancel()
-		q.backgroundWG.Wait()
 		done <- nil
 	}()
 
