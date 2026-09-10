@@ -133,3 +133,44 @@ func TestQueue_RateLimit(t *testing.T) {
 
 	t.Logf("elapsed time: %v", elapsed)
 }
+
+func TestQueue_RetryBackoffDeadLetter(t *testing.T) {
+	deadletter := make([]int, 0)
+	q := garden.NewQueue[int](func(item int) error {
+		if item%2 == 0 {
+			return errors.New("even number")
+		}
+		return nil
+	}, 2).WithRetries(2).
+		WithBackoff(func(_ int) time.Duration {
+			return 500 * time.Millisecond
+		}).
+		OnDeadLetter(func(item int, _ error, _ int) {
+			deadletter = append(deadletter, item)
+		})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	q.Serve(ctx)
+
+	start := time.Now()
+	_ = q.Push(1)
+	_ = q.Push(2)
+	_ = q.Push(3)
+
+	if err := q.DrainAndShutdown(ctx); err != nil {
+		t.Fatalf("failed to wait queue processing: %v", err)
+	}
+
+	elapsed := time.Since(start)
+	minExpectedDuration := 1 * time.Second
+	if elapsed < minExpectedDuration {
+		t.Errorf("item processing too fast: expected duration: %v, got %v", minExpectedDuration, elapsed)
+	}
+	for _, item := range deadletter {
+		if item%2 != 0 {
+			t.Errorf("item %d in dead letter is not a even number, dead letter size: %d", item, len(deadletter))
+		}
+	}
+}
