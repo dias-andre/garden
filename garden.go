@@ -43,11 +43,15 @@ type queueJob[T any] struct {
 type Queue[T any] struct {
 	mu              sync.Mutex
 	cond            *sync.Cond
-	wg              sync.WaitGroup
+	workersWG       sync.WaitGroup
+	backgroundWG    sync.WaitGroup
 	dispatchedItems chan queueJob[T]
 
 	closed   bool
 	draining bool
+
+	internalCtx       context.Context
+	internalCtxCancel context.CancelFunc
 
 	jobs        []queueJob[T]
 	workerFn    WorkerFn[T]
@@ -56,6 +60,130 @@ type Queue[T any] struct {
 	maxRetries     int
 	backoffFn      BackoffFn
 	onDeadLetterFn DeadLetterFn[T]
+
+	// rate limit
+	useRateLimit      bool
+	rateLimitItems    int
+	rateLimitInterval time.Duration
+	limitedTokens     chan struct{}
+}
+
+func (q *Queue[T]) pushJob(newJob queueJob[T]) error {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return errors.Join(errors.New("cannot push"), ErrQueueClosed)
+	}
+	if q.draining {
+		q.mu.Unlock()
+		return ErrQueueDraining
+	}
+	q.jobs = append(q.jobs, newJob)
+	q.mu.Unlock()
+	q.cond.Signal()
+	return nil
+}
+
+func (q *Queue[T]) popJob() (queueJob[T], bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.jobs) == 0 && !q.closed && !q.draining {
+		q.cond.Wait()
+	}
+	if len(q.jobs) == 0 {
+		var zero queueJob[T]
+		return zero, false
+	}
+	job := q.jobs[0]
+	q.jobs = q.jobs[1:]
+	return job, true
+}
+
+func (q *Queue[T]) processJob(job queueJob[T]) {
+	err := q.workerFn(job.item)
+	if err != nil {
+		if job.attempts <= q.maxRetries {
+			backoff := time.Second * 0
+			if q.backoffFn != nil {
+				backoff = q.backoffFn(job.attempts)
+			}
+			job.attempts++
+			job.lastErr = err
+			job.lastRetry = time.Now()
+
+			time.Sleep(backoff)
+			_ = q.pushJob(job)
+			return
+		}
+		if q.onDeadLetterFn != nil {
+			q.onDeadLetterFn(job.item, err, job.attempts)
+		}
+		return
+	}
+}
+
+func (q *Queue[T]) startWorkers() {
+	for i := 0; i < q.workerCount; i++ {
+		q.workersWG.Add(1)
+		go func(id int, items <-chan queueJob[T]) {
+			defer q.workersWG.Done()
+			for job := range items {
+				if q.useRateLimit {
+					<-q.limitedTokens
+				}
+				q.processJob(job)
+			}
+		}(i, q.dispatchedItems)
+	}
+}
+
+func (q *Queue[T]) startDispatcher(ctx context.Context) {
+	q.workersWG.Go(func() {
+		defer close(q.dispatchedItems)
+		for {
+			item, ok := q.popJob()
+			if !ok {
+				return
+			}
+			select {
+			case q.dispatchedItems <- item:
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
+}
+
+func clearChan[T any](ch <-chan T) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+func (q *Queue[T]) startRateLimitReset(ctx context.Context) {
+	q.backgroundWG.Go(func() {
+		ticker := time.NewTicker(q.rateLimitInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				clearChan(q.limitedTokens)
+				for i := 0; i < q.rateLimitItems; i++ {
+					select {
+					case q.limitedTokens <- struct{}{}:
+					default:
+					}
+				}
+			case <-ctx.Done():
+				clearChan(q.limitedTokens)
+				return
+			}
+		}
+	})
 }
 
 // NewQueue creates a new worker pool with the given worker function and worker count.
@@ -98,35 +226,11 @@ func (q *Queue[T]) OnDeadLetter(dt DeadLetterFn[T]) *Queue[T] {
 	return q
 }
 
-func (q *Queue[T]) pushJob(newJob queueJob[T]) error {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
-		return errors.Join(errors.New("cannot push"), ErrQueueClosed)
-	}
-	if q.draining {
-		q.mu.Unlock()
-		return ErrQueueDraining
-	}
-	q.jobs = append(q.jobs, newJob)
-	q.mu.Unlock()
-	q.cond.Signal()
-	return nil
-}
-
-func (q *Queue[T]) popJob() (queueJob[T], bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	for len(q.jobs) == 0 && !q.closed {
-		q.cond.Wait()
-	}
-	if len(q.jobs) == 0 {
-		var zero queueJob[T]
-		return zero, false
-	}
-	job := q.jobs[0]
-	q.jobs = q.jobs[1:]
-	return job, true
+func (q *Queue[T]) WithRateLimit(items int, interval time.Duration) *Queue[T] {
+	q.rateLimitItems = items
+	q.rateLimitInterval = interval
+	q.useRateLimit = true
+	return q
 }
 
 // Push adds an item to the queue for processing
@@ -162,57 +266,9 @@ func (q *Queue[T]) Close() {
 	q.closed = true
 	q.mu.Unlock()
 	q.cond.Broadcast()
-}
-
-func (q *Queue[T]) processJob(job queueJob[T]) {
-	err := q.workerFn(job.item)
-	if err != nil {
-		if job.attempts <= q.maxRetries {
-			backoff := time.Second * 0
-			if q.backoffFn != nil {
-				backoff = q.backoffFn(job.attempts)
-			}
-			job.attempts++
-			job.lastErr = err
-			job.lastRetry = time.Now()
-
-			time.Sleep(backoff)
-			_ = q.pushJob(job)
-		} else {
-			if q.onDeadLetterFn != nil {
-				q.onDeadLetterFn(job.item, err, job.attempts)
-			}
-		}
+	if q.internalCtxCancel != nil {
+		q.internalCtxCancel()
 	}
-}
-
-func (q *Queue[T]) startWorkers() {
-	for i := 0; i < q.workerCount; i++ {
-		q.wg.Add(1)
-		go func(id int, items <-chan queueJob[T]) {
-			defer q.wg.Done()
-			for job := range items {
-				q.processJob(job)
-			}
-		}(i, q.dispatchedItems)
-	}
-}
-
-func (q *Queue[T]) startDispatcher(ctx context.Context) {
-	q.wg.Go(func() {
-		defer close(q.dispatchedItems)
-		for {
-			item, ok := q.popJob()
-			if !ok {
-				return
-			}
-			select {
-			case q.dispatchedItems <- item:
-			case <-ctx.Done():
-				return
-			}
-		}
-	})
 }
 
 // Serve starts the worker pool and begins processing items from the queue.
@@ -243,10 +299,18 @@ func (q *Queue[T]) startDispatcher(ctx context.Context) {
 //	// Gracefully shutdown when done
 //	q.DrainAndShutdown(context.Background())
 func (q *Queue[T]) Serve(ctx context.Context) {
-	q.dispatchedItems = make(chan queueJob[T], 100)
-	q.startWorkers()
-	q.startDispatcher(ctx)
+	newCtx, newCancel := context.WithCancel(ctx)
+	q.internalCtx = newCtx
+	q.internalCtxCancel = newCancel
 
+	q.dispatchedItems = make(chan queueJob[T], 100)
+	if q.useRateLimit {
+		q.limitedTokens = make(chan struct{}, q.rateLimitItems)
+		q.startRateLimitReset(q.internalCtx)
+	}
+
+	q.startWorkers()
+	q.startDispatcher(q.internalCtx)
 	go func() {
 		<-ctx.Done()
 		q.Close()
@@ -272,7 +336,7 @@ func (q *Queue[T]) Shutdown(ctx context.Context) error {
 	q.Close()
 	done := make(chan struct{})
 	go func() {
-		q.wg.Wait()
+		q.workersWG.Wait()
 		close(done)
 	}()
 	select {
@@ -292,9 +356,6 @@ func (q *Queue[T]) Shutdown(ctx context.Context) error {
 // Returns an error if the context deadline is exceeded before all items are processed.
 // If the deadline is exceeded, Close() is called to force shutdown and return the error.
 //
-// Use this for critical workloads (e.g., email delivery) where losing items is unacceptable.
-// Use Shutdown for fast shutdown when graceful processing is not required.
-//
 // Example:
 //
 //	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -311,12 +372,14 @@ func (q *Queue[T]) DrainAndShutdown(ctx context.Context) error {
 	}
 
 	q.draining = true
-	q.mu.Unlock()
 	q.cond.Broadcast()
+	q.mu.Unlock()
 
 	done := make(chan error, 1)
 	go func() {
-		q.wg.Wait()
+		q.workersWG.Wait()
+		q.internalCtxCancel()
+		q.backgroundWG.Wait()
 		done <- nil
 	}()
 
