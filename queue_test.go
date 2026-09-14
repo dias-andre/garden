@@ -135,8 +135,14 @@ func TestQueue_RateLimit(t *testing.T) {
 }
 
 func TestQueue_RetryBackoffDeadLetter(t *testing.T) {
-	deadletter := make([]int, 0)
+	var deadletter []int
+	processedMap := make(map[int]int)
+
+	var mu sync.Mutex
 	q := garden.NewQueue[int](func(item int) error {
+		mu.Lock()
+		processedMap[item] = processedMap[item] + 1
+		mu.Unlock()
 		if item%2 == 0 {
 			return errors.New("even number")
 		}
@@ -145,7 +151,7 @@ func TestQueue_RetryBackoffDeadLetter(t *testing.T) {
 		WithBackoff(func(_ int) time.Duration {
 			return 500 * time.Millisecond
 		}).
-		OnDeadLetter(func(item int, _ error, _ int) {
+		OnDeadLetter(func(item int, err error, attempts int) {
 			deadletter = append(deadletter, item)
 		})
 
@@ -166,11 +172,28 @@ func TestQueue_RetryBackoffDeadLetter(t *testing.T) {
 	elapsed := time.Since(start)
 	minExpectedDuration := 1 * time.Second
 	if elapsed < minExpectedDuration {
-		t.Errorf("item processing too fast: expected duration: %v, got %v", minExpectedDuration, elapsed)
+		t.Fatalf("item processing too fast: expected duration: %v, got %v", minExpectedDuration, elapsed)
 	}
+	t.Logf("OK: item processing time: %v", elapsed)
 	for _, item := range deadletter {
 		if item%2 != 0 {
 			t.Errorf("item %d in dead letter is not a even number, dead letter size: %d", item, len(deadletter))
 		}
+	}
+
+	for item, count := range processedMap {
+		if item%2 == 0 && count != 3 {
+			t.Errorf("even item %d was processed %d times, expected 3", item, count)
+		}
+		if item%2 != 0 && count != 1 {
+			t.Errorf("odd item %d was processed %d times, expected exactly 1 (no retries)", item, count)
+		}
+	}
+
+	if len(deadletter) != 1 {
+		t.Errorf("expected 1 item in dead letter, got %d", len(deadletter))
+	}
+	if len(deadletter) > 0 && deadletter[0] != 2 {
+		t.Errorf("expected item 2 in dead letter, got %v", deadletter)
 	}
 }
