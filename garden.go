@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,9 +54,11 @@ type Queue[T any] struct {
 	internalCtxCancel context.CancelFunc
 
 	jobs        []queueJob[T]
+	pendingJobs atomic.Int64
 	workerFn    func(item T) error
 	workerCount int
 
+	retriesEnabled bool
 	maxRetries     int
 	backoffFn      func(int) time.Duration
 	onDeadLetterFn func(item T, err error, attempts int)
@@ -76,6 +79,9 @@ func (q *Queue[T]) pushJob(newJob queueJob[T]) error {
 		return errors.Join(errors.New("cannot push"), ErrQueueDraining)
 	}
 	q.jobs = append(q.jobs, newJob)
+	if newJob.attempts == 0 {
+		q.pendingJobs.Add(1)
+	}
 	q.mu.Unlock()
 	q.cond.Signal()
 	return nil
@@ -99,7 +105,7 @@ func (q *Queue[T]) popJob() (queueJob[T], bool) {
 func (q *Queue[T]) processJob(job queueJob[T]) {
 	err := q.workerFn(job.item)
 	if err != nil {
-		if job.attempts <= q.maxRetries {
+		if job.attempts < q.maxRetries && q.retriesEnabled {
 			backoff := time.Duration(0)
 			job.attempts++
 			job.lastErr = err
@@ -116,17 +122,21 @@ func (q *Queue[T]) processJob(job queueJob[T]) {
 				}
 			}
 
-			time.Sleep(backoff)
-			if err := q.pushJob(job); err != nil && q.onDeadLetterFn != nil {
-				q.onDeadLetterFn(job.item, err, job.attempts)
+			if err := q.pushJob(job); err != nil {
+				if q.onDeadLetterFn != nil {
+					q.onDeadLetterFn(job.item, err, job.attempts)
+				}
+				q.pendingJobs.Add(-1)
 			}
 			return
 		}
 		if q.onDeadLetterFn != nil {
 			q.onDeadLetterFn(job.item, err, job.attempts)
 		}
+		q.pendingJobs.Add(-1)
 		return
 	}
+	q.pendingJobs.Add(-1)
 }
 
 func (q *Queue[T]) startWorkers() {
@@ -153,7 +163,11 @@ func (q *Queue[T]) startDispatcher(ctx context.Context) {
 		for {
 			item, ok := q.popJob()
 			if !ok {
-				return
+				if q.pendingJobs.Load() == 0 {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+				continue
 			}
 			select {
 			case q.dispatchedItems <- item:
@@ -190,6 +204,7 @@ func NewQueue[T any](fn WorkerFn[T], count int) *Queue[T] {
 //	.WithBackoff(exponentialBackoff)
 func (q *Queue[T]) WithRetries(r int) *Queue[T] {
 	q.maxRetries = r
+	q.retriesEnabled = true
 	return q
 }
 
