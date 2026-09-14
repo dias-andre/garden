@@ -71,6 +71,28 @@ q := garden.NewQueue(sendEmail, 4). // sendEmail(item Email) error
  })
 ```
 
+### Rate limiting
+
+To cap how fast work is processed, register a rate limit with `WithRateLimit`. This is
+a global limit across the whole pool, not per worker:
+
+```go
+q := garden.NewQueue(fetchURL, 8).
+ WithRateLimit(10, time.Second) // at most 10 items per second
+
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+q.Serve(ctx)
+
+for _, url := range urls {
+ _ = q.Push(url)
+}
+if err := q.DrainAndShutdown(ctx); err != nil {
+ log.Fatal("shutdown failed:", err)
+}
+```
+
 ## How it works
 
 The core idea is a two-stage pipeline: an unbounded slice buffer feeds a bounded
@@ -83,6 +105,14 @@ Push(item)                Pop()                dispatchedItems            worker
         (slice + mutex         (dispatcher
          + cond)               goroutine)
 ```
+
+### Docs
+
+If you want to understand *why* each piece exists -- the choice of `sync.Cond` over a
+plain channel, the retry counting semantics, how the drain knows when it is truly
+finished -- there is a line-by-line code walkthrough in
+[docs/walkthrough.md](docs/walkthrough.md). It mirrors `garden.go` from the public API
+down to the concurrency primitives.
 
 ### Stage 1: the slice buffer
 
@@ -114,7 +144,11 @@ go func() {
     for {
         item, ok := q.Pop()
         if !ok {
-            return // queue closed, no more items
+            if q.pendingJobs.Load() == 0 {
+                return // nothing left, no retries in flight
+            }
+            time.Sleep(10 * time.Millisecond) // wait for re-queued retries
+            continue
         }
         q.dispatchedItems <- item // blocks if channel is full
     }
@@ -128,6 +162,11 @@ load balancing -- whichever worker is free picks up the next item:
 // simplified worker
 go func() {
     for job := range q.dispatchedItems {
+        if q.useRateLimit {
+            if err := q.rateLimiter.Wait(q.internalCtx); err != nil {
+                return // context cancelled
+            }
+        }
         q.processJob(job)
     }
 }()
@@ -143,32 +182,44 @@ error and retries are configured, the job is re-queued -- back into the same sli
 buffer, right where it started -- with its attempt counter incremented.
 
 ```go
+// simplified processJob
 func processJob(job queueJob) {
     err := workerFn(job.item)
     if err == nil {
         return
     }
-    if job.attempts <= maxRetries {
-        time.Sleep(backoffFn(job.attempts)) // exponential backoff
+    if q.retriesEnabled && job.attempts < maxRetries {
         job.attempts++
-        pushJob(job)                        // re-queue for another try
+        backoff := time.Duration(0)
+        if q.backoffFn != nil {
+            backoff = q.backoffFn(job.attempts)
+        }
+        select {
+        case <-time.After(backoff): // backoff is cancellation-aware
+        case <-q.internalCtx.Done():
+            return
+        }
+        q.pushJob(job) // re-queue for another try
         return
     }
-    onDeadLetterFn(job.item, err, job.attempts) // give up and report
+    q.onDeadLetterFn(job.item, err, job.attempts) // give up and report
 }
 ```
 
 Re-queueing is what makes retries work without any extra machinery: the job goes
 through the exact same pipeline as a freshly pushed item, so it is naturally processed
 by whichever worker finishes next. The `Push`-during-`Close` guard is skipped for
-internal re-pushes, so a drain that is still running keeps retrying in-flight work.
+internal re-pushes, so a drain that is still running keeps retrying in-flight work. The
+backoff sleep is also interrupted by shutdown, so a hard close never waits out a long
+delay.
 
 ### Graceful shutdown
 
 When the context passed to `Serve` is cancelled, a background goroutine calls `Close()`
-on the queue. This sets a `closed` flag and broadcasts to all blocked `Pop()` calls. The
-dispatcher sees the queue is closed, finishes sending any remaining items, closes the
-channel, and the workers drain whatever is left.
+on the queue. This sets a `closed` flag, broadcasts to all blocked `Pop()` calls, and
+cancels the queue's internal context (which also aborts any sleeping backoff or
+rate-limit wait). The dispatcher sees the queue is closed, finishes sending any
+remaining items, closes the channel, and the workers drain whatever is left.
 
 There are two ways to stop a running queue:
 
@@ -176,9 +227,10 @@ There are two ways to stop a running queue:
   finish, discarding items not yet dispatched. It returns an error if the context
   deadline expires first.
 - **`DrainAndShutdown(ctx)`** enters draining mode first: new `Push()` calls are
-  rejected, but every remaining item -- plus anything re-queued by retries -- is
-  processed before the workers stop. If the deadline expires, it forces a `Close()` and
-  returns the error.
+  rejected with `ErrQueueDraining`, but every remaining item -- plus anything re-queued
+  by retries -- is processed before the workers stop. A `pendingJobs` counter lets the
+  dispatcher tell "empty buffer" from "empty buffer with retries still to be re-queued".
+  If the deadline expires, it forces a `Close()` and returns the error.
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
@@ -217,6 +269,11 @@ and returns the `time.Duration` to sleep. Defaults to no delay.
 Sets the handler called when an item exhausts all retries. `DeadLetterFn` receives the
 item, the last error, and the total number of attempts. No-op by default.
 
+### `(*Queue).WithRateLimit(items int, interval time.Duration) *Queue[T]`
+
+Limits processing to `items` jobs per `interval` across the whole pool. Implemented with
+a token-bucket limiter; workers wait on the bucket before each job. Cancellation-aware.
+
 ### `Push(item T) error`
 
 Adds an item to the queue. Returns an error wrapping `ErrQueueClosed` if the queue has
@@ -226,7 +283,7 @@ blocks.
 ### `Pop() (T, bool)`
 
 Removes and returns the next item from the queue. Blocks until an item is available or
-the queue is closed/drainged. Returns `(zero, false)` when no items remain.
+the queue is closed/draining. Returns `(zero, false)` when no items remain.
 
 ### `Serve(ctx context.Context)`
 
@@ -266,6 +323,11 @@ runs immediately on the first failure.
 Four: the initial attempt plus three retries. The retry count passed to `WithBackoff` and
 `OnDeadLetter` starts at `1` for the first attempt after the initial failure.
 
+**Q: Can I rate limit the workers?**
+Yes, with `WithRateLimit(items, interval)`. It raises a global cap -- no more than
+`items` jobs start within each `interval`, regardless of how many workers there are. The
+limiter is a token bucket and is cancellation-aware.
+
 **Q: What is the channel capacity and can I change it?**
 The dispatch channel has a fixed capacity of 100. This is hardcoded. For a garden-sized
 tool, 100 items in flight is more than enough. If you need a different value, it would
@@ -284,7 +346,7 @@ You get an error wrapping `ErrQueueClosed`.
 
 ## Tests
 
-There are three tests in `queue_test.go` that cover the main behaviors:
+There are five tests in `queue_test.go` covering the main behaviors:
 
 **TestQueue_PushPop** -- Verifies basic FIFO semantics. Pushes three items, pops the
 first one, checks that it comes out in order. Simple sanity check.
@@ -298,6 +360,14 @@ even under heavy load.
 cancels the context and calls Shutdown. Asserts that Shutdown returns within 2 seconds,
 which catches goroutine leaks or deadlocks.
 
+**TestQueue_RateLimit** -- Pushes 20 items to 5 workers limited to 10 per second and
+asserts the run takes at least 1 second and every item is processed, verifying the global
+rate cap.
+
+**TestQueue_RetryBackoffDeadLetter** -- Pushes a mix of items, some of which always fail,
+with retries, backoff, and a dead-letter handler. Asserts failed items are attempted the
+expected number of times and land in the dead-letter sink exactly once.
+
 Run the tests with:
 
 ```
@@ -305,11 +375,6 @@ go test -v -race ./...
 ```
 
 The `-race` flag is recommended to catch any concurrency issues.
-
-## Docs
-
-A line-by-line walkthrough of the implementation lives in
-[docs/walkthrough.md](docs/walkthrough.md).
 
 ## License
 
