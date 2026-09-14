@@ -93,12 +93,18 @@ func (q *Queue[T]) popJob() (queueJob[T], bool) {
 	for len(q.jobs) == 0 && !q.closed && !q.draining {
 		q.cond.Wait()
 	}
+	var zero queueJob[T]
 	if len(q.jobs) == 0 {
-		var zero queueJob[T]
 		return zero, false
 	}
 	job := q.jobs[0]
+	q.jobs[0] = zero
 	q.jobs = q.jobs[1:]
+	if cap(q.jobs) > 64 && len(q.jobs) <= cap(q.jobs)/4 {
+		newJobs := make([]queueJob[T], len(q.jobs), len(q.jobs)*2)
+		copy(newJobs, q.jobs)
+		q.jobs = newJobs
+	}
 	return job, true
 }
 
