@@ -1,5 +1,7 @@
 # garden
 
+![Go](https://img.shields.io/badge/go-%2300ADD8.svg?style=for-the-badge&logo=go&logoColor=white)
+
 A small, generic worker pool for Go. The name is a reminder that this is meant for
 gardens, not factories -- small, personal environments where you need a handful of
 goroutines processing items without the overhead of a full message broker or job queue.
@@ -23,33 +25,33 @@ Requires Go 1.27 or later (generics). No external dependencies.
 package main
 
 import (
-	"context"
-	"fmt"
-	"time"
+ "context"
+ "fmt"
+ "time"
 
-	"github.com/dias-andre/garden"
+ "github.com/dias-andre/garden"
 )
 
 func main() {
-	q := garden.NewQueue(func(item string) error {
-		fmt.Println("processing:", item)
-		time.Sleep(100 * time.Millisecond)
-		return nil
-	}, 3) // 3 workers
+ q := garden.NewQueue(func(item string) error {
+  fmt.Println("processing:", item)
+  time.Sleep(100 * time.Millisecond)
+  return nil
+ }, 3) // 3 workers
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+ ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ defer cancel()
 
-	q.Serve(ctx)
+ q.Serve(ctx)
 
-	for i := 0; i < 10; i++ {
-		_ = q.Push(fmt.Sprintf("job-%d", i))
-	}
+ for i := 0; i < 10; i++ {
+  _ = q.Push(fmt.Sprintf("job-%d", i))
+ }
 
-	if err := q.Shutdown(ctx); err != nil {
-		fmt.Println("shutdown failed:", err)
-	}
-	fmt.Println("all done")
+ if err := q.Shutdown(ctx); err != nil {
+  fmt.Println("shutdown failed:", err)
+ }
+ fmt.Println("all done")
 }
 ```
 
@@ -60,13 +62,13 @@ and, once the retries are exhausted, hand it to a dead-letter handler:
 
 ```go
 q := garden.NewQueue(sendEmail, 4). // sendEmail(item Email) error
-	WithRetries(3).
-	WithBackoff(func(attempt int) time.Duration {
-		return time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s
-	}).
-	OnDeadLetter(func(item Email, err error, attempts int) {
-		log.Printf("email %q failed after %d attempts: %v", item.Subject, attempts, err)
-	})
+ WithRetries(3).
+ WithBackoff(func(attempt int) time.Duration {
+  return time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s
+ }).
+ OnDeadLetter(func(item Email, err error, attempts int) {
+  log.Printf("email %q failed after %d attempts: %v", item.Subject, attempts, err)
+ })
 ```
 
 ## How it works
