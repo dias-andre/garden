@@ -35,11 +35,11 @@ func TestQueue_NoDuplicateProcessing(t *testing.T) {
 		return nil
 	}, numWorkers)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	q.Serve(ctx)
 
-	for i := 0; i < numItems; i++ {
+	for i := range numItems {
 		_ = q.Push(i)
 	}
 
@@ -61,7 +61,7 @@ func TestQueue_NoDuplicateProcessing(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	for i := 0; i < numItems; i++ {
+	for i := range numItems {
 		if seen[i] != 1 {
 			t.Errorf("item %d was processed %d times (expected 1)", i, seen[i])
 		}
@@ -69,17 +69,17 @@ func TestQueue_NoDuplicateProcessing(t *testing.T) {
 }
 
 func TestQueue_GracefulShutdown(t *testing.T) {
-	var processed int64
+	var processed atomic.Int64
 
 	q := garden.NewQueue(func(item int) error {
-		atomic.AddInt64(&processed, 1)
+		processed.Add(1)
 		time.Sleep(5 * time.Millisecond)
 		return nil
 	}, 4)
 	ctx, cancel := context.WithCancel(context.Background())
 	q.Serve(ctx)
 
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		_ = q.Push(i)
 	}
 	time.Sleep(20 * time.Millisecond) // let some items process
@@ -94,13 +94,13 @@ func TestQueue_GracefulShutdown(t *testing.T) {
 		t.Fatalf("Failed to run shutdown: %v", err)
 	}
 
-	t.Logf("processed items before shutdown: %d", atomic.LoadInt64(&processed))
+	t.Logf("processed items before shutdown: %d", processed.Load())
 }
 
 func TestQueue_RateLimit(t *testing.T) {
 	var processedCount atomic.Int64
 
-	q := garden.NewQueue[int](func(item int) error {
+	q := garden.NewQueue(func(item int) error {
 		processedCount.Add(1)
 		return nil
 	}, 5).WithRateLimit(10, time.Second)
@@ -110,7 +110,7 @@ func TestQueue_RateLimit(t *testing.T) {
 
 	q.Serve(ctx)
 	totalJobs := 20
-	for i := 0; i < totalJobs; i++ {
+	for i := range totalJobs {
 		_ = q.Push(i)
 	}
 

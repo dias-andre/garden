@@ -22,9 +22,9 @@ func BenchmarkQueueMemory(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
-		if err := queue.Push(i); err != nil {
-			b.Fatalf("failed to push item %d, err: %v", i, err)
+	for b.Loop() {
+		if err := queue.Push(1); err != nil {
+			b.Fatalf("failed to push item, err: %v", err)
 		}
 	}
 
