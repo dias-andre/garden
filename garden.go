@@ -68,23 +68,33 @@ type Queue[T any] struct {
 	rateLimiter  *rateLimiter
 }
 
-func (q *Queue[T]) pushJob(newJob queueJob[T]) error {
+func (q *Queue[T]) pushJobInternal(j queueJob[T]) error {
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
-		return errors.Join(errors.New("cannot push"), ErrQueueClosed)
+		return ErrQueueClosed
 	}
-	if q.draining && newJob.attempts == 0 {
+
+	if q.draining && j.attempts == 0 {
 		q.mu.Unlock()
-		return errors.Join(errors.New("cannot push"), ErrQueueDraining)
+		return ErrQueueDraining
 	}
-	q.jobs = append(q.jobs, newJob)
-	if newJob.attempts == 0 {
-		q.pendingJobs.Add(1)
-	}
+
+	q.jobs = append(q.jobs, j)
 	q.mu.Unlock()
 	q.cond.Signal()
 	return nil
+}
+
+func (q *Queue[T]) pushJob(newJob queueJob[T]) error {
+	if newJob.attempts == 0 {
+		q.pendingJobs.Add(1)
+	}
+	return q.pushJobInternal(newJob)
+}
+
+func (q *Queue[T]) retryJob(j queueJob[T]) error {
+	return q.pushJobInternal(j)
 }
 
 func (q *Queue[T]) popJob() (queueJob[T], bool) {
@@ -128,7 +138,7 @@ func (q *Queue[T]) processJob(job queueJob[T]) {
 				}
 			}
 
-			if err := q.pushJob(job); err != nil {
+			if err := q.retryJob(job); err != nil {
 				if q.onDeadLetterFn != nil {
 					q.onDeadLetterFn(job.item, err, job.attempts)
 				}
@@ -307,10 +317,6 @@ func (q *Queue[T]) Serve(ctx context.Context) {
 	q.startDispatcher(q.internalCtx)
 
 	q.startWorkers()
-	go func() {
-		<-ctx.Done()
-		q.Close()
-	}()
 }
 
 // Shutdown closes the queue immediately and stops all workers.
