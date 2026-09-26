@@ -1,4 +1,4 @@
-package garden
+package lib
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-type rateLimiter struct {
+type RateLimiter struct {
 	mu         sync.Mutex
 	tokens     float64
 	maxTokens  float64
@@ -14,9 +14,9 @@ type rateLimiter struct {
 	lastUpdate time.Time
 }
 
-func newRateLimiter(limit int, interval time.Duration) *rateLimiter {
+func NewRateLimiter(limit int, interval time.Duration) *RateLimiter {
 	rate := float64(limit) / interval.Seconds()
-	return &rateLimiter{
+	return &RateLimiter{
 		tokens:     float64(limit),
 		maxTokens:  float64(limit),
 		fillRate:   rate,
@@ -24,7 +24,7 @@ func newRateLimiter(limit int, interval time.Duration) *rateLimiter {
 	}
 }
 
-func (r *rateLimiter) Wait(ctx context.Context) error {
+func (r *RateLimiter) Wait(ctx context.Context) error {
 	r.mu.Lock()
 
 	now := time.Now()

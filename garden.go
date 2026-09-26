@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/dias-andre/garden/internal/lib"
 )
 
 var (
@@ -65,7 +67,7 @@ type Queue[T any] struct {
 
 	// rate limit
 	useRateLimit bool
-	rateLimiter  *rateLimiter
+	rateLimiter  *lib.RateLimiter
 }
 
 func (q *Queue[T]) pushJobInternal(j queueJob[T]) error {
@@ -238,7 +240,7 @@ func (q *Queue[T]) OnDeadLetter(dt func(item T, err error, attempt int)) *Queue[
 func (q *Queue[T]) WithRateLimit(items int, interval time.Duration) *Queue[T] {
 	// q.rateLimitItems = items
 	// q.rateLimitInterval = interval
-	q.rateLimiter = newRateLimiter(items, interval)
+	q.rateLimiter = lib.NewRateLimiter(items, interval)
 	q.useRateLimit = true
 	return q
 }
