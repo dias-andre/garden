@@ -28,8 +28,8 @@ type Scheduler[T any] struct {
 	UseRateLimit bool
 	Limiter      *lib.RateLimiter
 
-	OnFailureHook func(T)
-	OnSuccessHook func(T)
+	OnFailureHook func(context.Context, T)
+	OnSuccessHook func(context.Context, T)
 	OnBackoffHook func(T, context.Context)
 	MaxRetries    int
 
@@ -42,14 +42,14 @@ type Scheduler[T any] struct {
 
 func (s *Scheduler[T]) onSuccess(j T) {
 	if s.OnSuccessHook != nil {
-		s.OnSuccessHook(j)
+		s.OnSuccessHook(s.ctx, j)
 	}
 	s.pendingJobs.Add(-1)
 }
 
 func (s *Scheduler[T]) onFailure(j T) {
 	if s.OnFailureHook != nil {
-		s.OnFailureHook(j)
+		s.OnFailureHook(s.ctx, j)
 	}
 	s.pendingJobs.Add(-1)
 }

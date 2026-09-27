@@ -1,15 +1,26 @@
 package garden_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/dias-andre/garden"
 )
 
+func mockCommitPending(_ context.Context, _ int) error { return nil }
+func mockCommitSuccess(_ context.Context, _ int) error { return nil }
+
 func TestSourcedQueue_PushPop(t *testing.T) {
-	sq := garden.NewSourcedQueue(func(i int) error {
+	sq, err := garden.NewSourcedQueue[int](func(i int) error {
 		return nil
-	}, 2)
+	}, 2, garden.SourcedHooks[int]{
+		CommitPending: mockCommitPending,
+		CommitSuccess: mockCommitSuccess,
+	})
+
+	if err != nil {
+		t.Fatalf("failed to create SourcedQueue, err: %v", err)
+	}
 
 	_ = sq.Push(1)
 	_ = sq.Push(2)

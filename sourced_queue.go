@@ -2,6 +2,7 @@ package garden
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -71,16 +72,32 @@ func (s *sourceWithRetry[T]) EnqueueRetry(_ context.Context, job queueJob[T], er
 	return s.pushJob(job)
 }
 
+type SourcedHooks[T any] struct {
+	CommitPending func(ctx context.Context, item T) error
+	CommitSuccess func(ctx context.Context, item T) error
+
+	CommitFailed func(ctx context.Context, item T, err error, attempts int) error
+}
+
 type SourcedQueue[T any] struct {
 	workerFn  func(T) error
 	source    *sourceWithRetry[T]
 	scheduler *scheds.Scheduler[queueJob[T]]
 
+	hooks SourcedHooks[T]
+
 	ctx       context.Context
 	cancelCtx context.CancelFunc
 }
 
-func NewSourcedQueue[T any](fn func(T) error, count int) *SourcedQueue[T] {
+func NewSourcedQueue[T any](fn func(T) error, count int, h SourcedHooks[T]) (*SourcedQueue[T], error) {
+	if h.CommitPending == nil {
+		return nil, errors.New("CommitPending is required")
+	}
+	if h.CommitSuccess == nil {
+		return nil, errors.New("CommitSuccess is required")
+	}
+
 	fifo := lib.NewFifo[queueJob[T]]()
 	sq := &SourcedQueue[T]{
 		workerFn: fn,
@@ -95,10 +112,27 @@ func NewSourcedQueue[T any](fn func(T) error, count int) *SourcedQueue[T] {
 		},
 	}
 	sq.scheduler.Source = sq.source
-	return sq
+	sq.hooks = h
+
+	sq.scheduler.OnSuccessHook = func(ctx context.Context, qj queueJob[T]) {
+		sq.hooks.CommitSuccess(ctx, qj.item)
+	}
+
+	if sq.hooks.CommitFailed != nil {
+		sq.scheduler.OnFailureHook = func(ctx context.Context, qj queueJob[T]) {
+			sq.hooks.CommitFailed(ctx, qj.item, qj.lastErr, qj.attempts)
+		}
+	}
+
+	sq.ctx, sq.cancelCtx = context.WithCancel(context.Background())
+
+	return sq, nil
 }
 
 func (sq *SourcedQueue[T]) Push(item T) error {
+	if commitErr := sq.hooks.CommitPending(sq.ctx, item); commitErr != nil {
+		return commitErr
+	}
 	if err := sq.source.pushJob(queueJob[T]{
 		item:     item,
 		attempts: 0,
