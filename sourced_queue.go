@@ -10,8 +10,10 @@ import (
 	"github.com/dias-andre/garden/internal/scheds"
 )
 
-type sourceWithRetry[T any] struct {
+// implements scheds.SchedulerSourceWithRetry
+type localSource[T any] struct {
 	mu   sync.Mutex
+	cond *sync.Cond
 	fifo *lib.Fifo[queueJob[T]]
 
 	maxRetries int
@@ -20,7 +22,7 @@ type sourceWithRetry[T any] struct {
 	draining bool
 }
 
-func (s *sourceWithRetry[T]) pushJob(job queueJob[T]) error {
+func (s *localSource[T]) pushJob(job queueJob[T]) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -32,40 +34,53 @@ func (s *sourceWithRetry[T]) pushJob(job queueJob[T]) error {
 	}
 	s.mu.Unlock()
 	s.fifo.Push(job)
+	s.cond.Signal()
 	return nil
 }
 
-func (s *sourceWithRetry[T]) close() {
+func (s *localSource[T]) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
-	s.fifo.Broadcast()
+	s.cond.Broadcast()
 }
 
-func (s *sourceWithRetry[T]) enableDraining() error {
+func (s *localSource[T]) enableDraining() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return ErrQueueClosed
 	}
 	s.draining = true
-	s.fifo.Broadcast()
+	s.cond.Broadcast()
 	s.mu.Unlock()
 	return nil
 }
 
-func (s *sourceWithRetry[T]) Next(_ context.Context) (queueJob[T], bool) {
+func (s *localSource[T]) Next(_ context.Context) (queueJob[T], bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for s.fifo.Size() == 0 && !s.closed && !s.draining {
+		s.cond.Wait()
+	}
+
+	if s.fifo.Size() == 0 {
+		var zero queueJob[T]
+		return zero, false
+	}
+
 	return s.fifo.Pop()
 }
 
-func (s *sourceWithRetry[T]) CanRetry(job queueJob[T], _ error) bool {
+func (s *localSource[T]) CanRetry(job queueJob[T], _ error) bool {
 	if s.maxRetries > 0 && job.attempts < s.maxRetries {
 		return true
 	}
 	return false
 }
 
-func (s *sourceWithRetry[T]) EnqueueRetry(_ context.Context, job queueJob[T], err error) error {
+func (s *localSource[T]) EnqueueRetry(_ context.Context, job queueJob[T], err error) error {
 	job.attempts++
 	job.lastErr = err
 	job.lastRetry = time.Now()
@@ -81,7 +96,7 @@ type SourcedHooks[T any] struct {
 
 type SourcedQueue[T any] struct {
 	workerFn  func(T) error
-	source    *sourceWithRetry[T]
+	source    *localSource[T]
 	scheduler *scheds.Scheduler[queueJob[T]]
 
 	hooks SourcedHooks[T]
@@ -101,7 +116,7 @@ func NewSourcedQueue[T any](fn func(T) error, count int, h SourcedHooks[T]) (*So
 	fifo := lib.NewFifo[queueJob[T]]()
 	sq := &SourcedQueue[T]{
 		workerFn: fn,
-		source: &sourceWithRetry[T]{
+		source: &localSource[T]{
 			fifo: fifo,
 		},
 		scheduler: &scheds.Scheduler[queueJob[T]]{
@@ -111,6 +126,7 @@ func NewSourcedQueue[T any](fn func(T) error, count int, h SourcedHooks[T]) (*So
 			WorkerCount: count,
 		},
 	}
+	sq.source.cond = sync.NewCond(&sq.source.mu)
 	sq.scheduler.Source = sq.source
 	sq.hooks = h
 

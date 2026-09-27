@@ -4,14 +4,12 @@ import "sync"
 
 type Fifo[T any] struct {
 	mu           sync.Mutex
-	cond         *sync.Cond
 	items        []T
 	minShrinkCap int
 }
 
 func NewFifo[T any]() *Fifo[T] {
 	var newFifo Fifo[T]
-	newFifo.cond = sync.NewCond(&newFifo.mu)
 	newFifo.minShrinkCap = 100
 	return &newFifo
 }
@@ -25,15 +23,11 @@ func (f *Fifo[T]) Push(item T) {
 	f.mu.Lock()
 	f.items = append(f.items, item)
 	f.mu.Unlock()
-	f.cond.Signal()
 }
 
 func (f *Fifo[T]) Pop() (T, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for len(f.items) == 0 {
-		f.cond.Wait()
-	}
 	var zero T
 	if len(f.items) == 0 {
 		return zero, false
@@ -48,10 +42,6 @@ func (f *Fifo[T]) Pop() (T, bool) {
 		f.items = newItems
 	}
 	return item, true
-}
-
-func (f *Fifo[T]) Broadcast() {
-	f.cond.Broadcast()
 }
 
 func (f *Fifo[T]) Size() int {
