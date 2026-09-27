@@ -28,8 +28,9 @@ type Scheduler[T any] struct {
 	UseRateLimit bool
 	Limiter      *lib.RateLimiter
 
-	FailureHook   func(T)
+	OnFailureHook func(T)
 	OnSuccessHook func(T)
+	OnBackoffHook func(T, context.Context)
 	MaxRetries    int
 
 	wg  sync.WaitGroup
@@ -47,10 +48,16 @@ func (s *Scheduler[T]) onSuccess(j T) {
 }
 
 func (s *Scheduler[T]) onFailure(j T) {
-	if s.FailureHook != nil {
-		s.FailureHook(j)
+	if s.OnFailureHook != nil {
+		s.OnFailureHook(j)
 	}
 	s.pendingJobs.Add(-1)
+}
+
+func (s *Scheduler[T]) handleBackoff(job T) {
+	if s.OnBackoffHook != nil {
+		s.OnBackoffHook(job, s.ctx)
+	}
 }
 
 func (s *Scheduler[T]) processJob(job T) {
@@ -60,6 +67,7 @@ func (s *Scheduler[T]) processJob(job T) {
 		source, ok := s.Source.(SchedulerSourceWithRetry[T])
 		// supports retry
 		if ok && source.CanRetry(job, err) {
+			s.handleBackoff(job)
 			if retryErr := source.EnqueueRetry(s.ctx, job, err); retryErr != nil {
 				s.onFailure(job)
 			}
